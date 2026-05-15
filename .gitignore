@@ -33,6 +33,11 @@ ENV/
 # IDE specific files
 .idea/
 .vscode/
+.codex/
+.cursor/
+.claude/
+.mcp.json
+opencode.json
 *.swp
 *.swo
 .DS_Store
@@ -49,6 +54,7 @@ htmlcov/
 # Logs
 *.log
 logs/
+.langgraph-dev.pid
 
 # Local development
 .env.local

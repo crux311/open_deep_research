@@ -28,6 +28,10 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from open_deep_research.raindrop_bootstrap import (
+    finish_interaction,
+    start_interaction,
+)
 from open_deep_research.state import (
     AgentInputState,
     AgentState,
@@ -72,12 +76,33 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     """
     # Step 1: Check if clarification is enabled in configuration
     configurable = Configuration.from_runnable_config(config)
+    messages = state["messages"]
+    existing_raindrop_event_id = state.get("raindrop_event_id")
+    raindrop_event_id = None
+    if not existing_raindrop_event_id:
+        metadata = config.get("metadata", {}) if config else {}
+        configurable_context = config.get("configurable", {}) if config else {}
+        raindrop_event_id = start_interaction(
+            user_id=str(metadata.get("owner") or configurable_context.get("user_id") or "local-user"),
+            event="open_deep_research",
+            input_text=get_buffer_string(messages),
+            convo_id=str(configurable_context.get("thread_id") or ""),
+            properties={
+                "agent": "open_deep_research",
+                "search_api": configurable.search_api.value,
+                "research_model": configurable.research_model,
+                "final_report_model": configurable.final_report_model,
+            },
+        )
+
     if not configurable.allow_clarification:
         # Skip clarification step and proceed directly to research
-        return Command(goto="write_research_brief")
+        update = {}
+        if raindrop_event_id is not None:
+            update["raindrop_event_id"] = raindrop_event_id
+        return Command(goto="write_research_brief", update=update)
     
     # Step 2: Prepare the model for structured clarification analysis
-    messages = state["messages"]
     model_config = {
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
@@ -103,15 +128,21 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     # Step 4: Route based on clarification analysis
     if response.need_clarification:
         # End with clarifying question for user
+        finish_interaction(existing_raindrop_event_id or raindrop_event_id, output=response.question)
         return Command(
             goto=END, 
             update={"messages": [AIMessage(content=response.question)]}
         )
     else:
         # Proceed to research with verification message
+        update = {
+            "messages": [AIMessage(content=response.verification)]
+        }
+        if raindrop_event_id is not None:
+            update["raindrop_event_id"] = raindrop_event_id
         return Command(
             goto="write_research_brief", 
-            update={"messages": [AIMessage(content=response.verification)]}
+            update=update
         )
 
 
@@ -652,6 +683,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             ])
             
             # Return successful report generation
+            finish_interaction(state.get("raindrop_event_id"), output=str(final_report.content))
             return {
                 "final_report": final_report.content, 
                 "messages": [final_report],
@@ -667,6 +699,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     # First retry: determine initial truncation limit
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
+                        failure_output = f"Error generating final report: Token limit exceeded and no token limit is configured for {configurable.final_report_model}."
+                        finish_interaction(state.get("raindrop_event_id"), output=failure_output)
                         return {
                             "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
                             "messages": [AIMessage(content="Report generation failed due to token limits")],
@@ -683,6 +717,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 continue
             else:
                 # Non-token-limit error: return error immediately
+                finish_interaction(state.get("raindrop_event_id"), output=f"Error generating final report: {e}")
                 return {
                     "final_report": f"Error generating final report: {e}",
                     "messages": [AIMessage(content="Report generation failed due to an error")],
@@ -690,6 +725,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 }
     
     # Step 4: Return failure result if all retries exhausted
+    finish_interaction(state.get("raindrop_event_id"), output="Error generating final report: Maximum retries exceeded")
     return {
         "final_report": "Error generating final report: Maximum retries exceeded",
         "messages": [AIMessage(content="Report generation failed after maximum retries")],
